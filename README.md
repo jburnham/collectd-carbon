@@ -146,7 +146,7 @@ yielding the metrics (along the lines of)
 
 Instead, if you configure carbon_writer to have a ManglePlugin, this
 class will have full control over how the path will be made. No
-additional processing will done to the path except for DifferentiateCounters.
+additional processing will be done to the path except for DifferentiateCounters.
 
 ## COUNTER and DERIVE Types
 
