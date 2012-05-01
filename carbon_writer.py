@@ -13,14 +13,19 @@
 #  limitations under the License.
 #
 import collectd
+import cPickle
 import errno
 import socket
 from string import maketrans
+import struct
 from time import time
 from traceback import format_exc
 
 host = None
 port = None
+buffer = []
+buffer_max_lines = 5000
+buffer_flush_interval = 60
 differentiate_values = False
 differentiate_values_over_time = False
 lowercase_metric_names = False
@@ -29,6 +34,8 @@ types = {}
 postfix = None
 host_separator = "_"
 metric_separator = "."
+use_pickle_receiver = False
+mangle_plugin = False
 
 def carbon_parse_types_file(path):
     global types
@@ -88,13 +95,26 @@ def sanitize_field(field):
 def carbon_config(c):
     global host, port, differentiate_values, differentiate_values_over_time, \
             prefix, postfix, host_separator, metric_separator, \
-            lowercase_metric_names
+            lowercase_metric_names, use_pickle_receiver, mangle_plugin
 
+    line_receiver_host_selected = False
+    line_receiver_port_selected = False
+    pickle_receiver_host_selected = False
+    pickle_receiver_port_selected = False
     for child in c.children:
         if child.key == 'LineReceiverHost':
             host = child.values[0]
+            line_receiver_host_selected = True
         elif child.key == 'LineReceiverPort':
             port = int(child.values[0])
+            line_receiver_port_selected = True
+        elif child.key == 'PickleReceiverHost':
+            use_pickle_receiver = True
+            host = child.values[0]
+            pickle_receiver_host_selected = True
+        elif child.key == 'PickleReceiverPort':
+            port = child.values[0]
+            pickle_receiver_port_selected = True
         elif child.key == 'TypesDB':
             for v in child.values:
                 carbon_parse_types_file(v)
@@ -108,6 +128,8 @@ def carbon_config(c):
             differentiate_values_over_time = True
         elif child.key == 'LowercaseMetricNames':
             lowercase_metric_names = True
+        elif child.key == 'ManglePlugin':
+            mangle_plugin = child.values[0]
         elif child.key == 'MetricPrefix':
             prefix = child.values[0]
         elif child.key == 'HostPostfix':
@@ -117,11 +139,23 @@ def carbon_config(c):
         elif child.key == 'MetricSeparator':
             metric_separator = child.values[0]
 
+    if line_receiver_host_selected and pickle_receiver_host_selected:
+        raise Exception('You cannot define both a Line and Pickle receiver host')
+
+    if line_receiver_port_selected and pickle_receiver_port_selected:
+        raise Exception('You cannot define both a Line and Pickle receiver port')
+
+    if line_receiver_host_selected and not line_receiver_port_selected:
+        raise Exception('You must define both a LineReceiverHost and LineReceiverPort')
+
+    if pickle_receiver_host_selected and not pickle_receiver_port_selected:
+        raise Exception('You must define both a PickleReceiverHost and PickleReceiverPort')
+
     if not host:
-        raise Exception('LineReceiverHost not defined')
+        raise Exception('You must define a Receiver Host')
 
     if not port:
-        raise Exception('LineReceiverPort not defined')
+        raise Exception('You must define a Receiver Port')
 
 def carbon_init():
     import threading
@@ -135,7 +169,9 @@ def carbon_init():
         'sock': None,
         'lock': threading.Lock(),
         'values': { },
-        'last_connect_time': 0
+        'last_connect_time': 0,
+        'last_flush_time': 0,
+        'mangle_plugin': __import__(mangle_plugin)
     }
 
     carbon_connect(d)
@@ -165,11 +201,32 @@ def carbon_connect(data):
 
     return result
 
-def carbon_write_data(data, s):
+def carbon_write_data(data):
     result = False
+    global buffer
+    global buffer_max_lines
+    global buffer_flush_interval
     data['lock'].acquire()
+    now = time()
+    if len(buffer) < buffer_max_lines:
+        # don't flush the buffer if < buffer_flush_interval old
+        if now - data['last_flush_time'] < buffer_flush_interval:
+            data['lock'].release()
+            return result
     try:
+        collectd.info("Buffer: %s" % len(buffer))
+        if use_pickle_receiver:
+            serialized_data = cPickle.dumps(buffer, protocol=-1)
+            length_prefix = struct.pack("!L", len(serialized_data))
+            s = length_prefix + serialized_data
+        else:
+            lines = []
+            for metric in buffer:
+                lines.append('%s %f %d' % (metric[0], metric[1][1], metric[1][0]))
+            s = '\n'.join(lines)
+        buffer = []
         data['sock'].sendall(s)
+        data['last_flush_time'] = now
         result = True
     except socket.error, e:
         data['sock'] = None
@@ -184,6 +241,7 @@ def carbon_write_data(data, s):
     return result
 
 def carbon_write(v, data=None):
+    global buffer
     data['lock'].acquire()
     if not carbon_connect(data):
         data['lock'].release()
@@ -202,22 +260,27 @@ def carbon_write(v, data=None):
         collectd.warning('carbon_writer: differing number of values for type %s' % v.type)
         return
 
-    metric_fields = []
-    if prefix:
-        metric_fields.append(prefix)
+    if not mangle_plugin:
+        metric_fields = []
+        if prefix:
+            metric_fields.append(prefix)
 
-    metric_fields.append(v.host.replace('.', host_separator))
+        metric_fields.append(v.host.replace('.', host_separator))
 
-    if postfix is not None:
-        metric_fields.append(postfix)
+        if postfix is not None:
+            metric_fields.append(postfix)
 
-    metric_fields.append(v.plugin)
-    if v.plugin_instance:
-        metric_fields.append(sanitize_field(v.plugin_instance))
+        metric_fields.append(v.plugin)
+        if v.plugin_instance:
+            metric_fields.append(sanitize_field(v.plugin_instance))
 
-    metric_fields.append(v.type)
-    if v.type_instance:
-        metric_fields.append(sanitize_field(v.type_instance))
+        metric_fields.append(v.type)
+        if v.type_instance:
+            metric_fields.append(sanitize_field(v.type_instance))
+    else:
+        metric_fields = data['mangle_plugin'].mangle_path(prefix, v.host, postfix, v.plugin, v.plugin_instance, v.type, v.type_instance)
+        if metric_fields is None:
+            return
 
     time = v.time
 
@@ -229,7 +292,6 @@ def carbon_write(v, data=None):
     for value in v.values:
         ds_name = v_type[i][0]
         ds_type = v_type[i][1]
-
         path_fields = metric_fields[:]
         path_fields.append(ds_name)
 
@@ -273,15 +335,13 @@ def carbon_write(v, data=None):
             new_value = value
 
         if new_value is not None:
-            line = '%s %f %d' % ( metric, new_value, time )
-            lines.append(line)
+            buffer.append([metric, [time, new_value]])
 
         i += 1
 
     data['lock'].release()
 
-    lines.append('')
-    carbon_write_data(data, '\n'.join(lines))
+    carbon_write_data(data)
 
 collectd.register_config(carbon_config)
 collectd.register_init(carbon_init)
