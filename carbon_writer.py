@@ -21,11 +21,9 @@ import struct
 from time import time
 from traceback import format_exc
 
+data = {}
 host = None
 port = None
-buffer = []
-buffer_max_lines = 5000
-buffer_flush_interval = 60
 differentiate_values = False
 differentiate_values_over_time = False
 lowercase_metric_names = False
@@ -159,13 +157,17 @@ def carbon_config(c):
 
 def carbon_init():
     import threading
+    global data
 
-    d = {
+    data = {
         'host': host,
         'port': port,
         'differentiate_values': differentiate_values,
         'differentiate_values_over_time': differentiate_values_over_time,
         'lowercase_metric_names': lowercase_metric_names,
+        'buffer': [],
+        'buffer_max_lines': 5000,
+        'buffer_flush_interval': 60,
         'sock': None,
         'lock': threading.Lock(),
         'values': { },
@@ -174,12 +176,13 @@ def carbon_init():
         'mangle_plugin': __import__(mangle_plugin)
     }
 
-    carbon_connect(d)
+    carbon_connect()
 
-    collectd.register_write(carbon_write, data=d)
+    collectd.register_write(carbon_write)
 
-def carbon_connect(data):
+def carbon_connect():
     result = False
+    global data
 
     if not data['sock']:
         # only attempt reconnect every 10 seconds
@@ -201,30 +204,28 @@ def carbon_connect(data):
 
     return result
 
-def carbon_write_data(data):
+def carbon_write_data():
     result = False
-    global buffer
-    global buffer_max_lines
-    global buffer_flush_interval
+    global data
     data['lock'].acquire()
     now = time()
-    if len(buffer) < buffer_max_lines:
+    if len(data['buffer']) < data['buffer_max_lines']:
         # don't flush the buffer if < buffer_flush_interval old
-        if now - data['last_flush_time'] < buffer_flush_interval:
+        if now - data['last_flush_time'] < data['buffer_flush_interval']:
             data['lock'].release()
             return result
     try:
-        collectd.info("Buffer: %s" % len(buffer))
+        collectd.info("Buffer: %s" % len(data['buffer']))
         if use_pickle_receiver:
-            serialized_data = cPickle.dumps(buffer, protocol=-1)
+            serialized_data = cPickle.dumps(data['buffer'], protocol=-1)
             length_prefix = struct.pack("!L", len(serialized_data))
             s = length_prefix + serialized_data
         else:
             lines = []
-            for metric in buffer:
+            for metric in data['buffer']:
                 lines.append('%s %f %d' % (metric[0], metric[1][1], metric[1][0]))
             s = '\n'.join(lines)
-        buffer = []
+        data['buffer'] = []
         data['sock'].sendall(s)
         data['last_flush_time'] = now
         result = True
@@ -240,10 +241,9 @@ def carbon_write_data(data):
     data['lock'].release()
     return result
 
-def carbon_write(v, data=None):
-    global buffer
+def carbon_write(v):
     data['lock'].acquire()
-    if not carbon_connect(data):
+    if not carbon_connect():
         data['lock'].release()
         collectd.warning('carbon_writer: no connection to carbon server')
         return
@@ -278,7 +278,7 @@ def carbon_write(v, data=None):
         if v.type_instance:
             metric_fields.append(sanitize_field(v.type_instance))
     else:
-        metric_fields = data['mangle_plugin'].mangle_path(prefix, v.host, postfix, v.plugin, v.plugin_instance, v.type, v.type_instance)
+        metric_fields = data['mangle_plugin'].mangle_path(prefix, postfix, v)
         if metric_fields is None:
             return
 
@@ -335,13 +335,13 @@ def carbon_write(v, data=None):
             new_value = value
 
         if new_value is not None:
-            buffer.append([metric, [time, new_value]])
+            data['buffer'].append([metric, [time, new_value]])
 
         i += 1
 
     data['lock'].release()
 
-    carbon_write_data(data)
+    carbon_write_data()
 
 collectd.register_config(carbon_config)
 collectd.register_init(carbon_init)

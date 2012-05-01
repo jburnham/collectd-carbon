@@ -39,8 +39,13 @@ parameters via the <Module> config section in your Collectd config. The
 following parameters are recognized:
 
 * LineReceiverHost - hostname or IP address where a Carbon line receiver
-  is listening
-* LineReceiverPort - port on which line receiver is listening
+  is listening (mutually exclusive with PickleReceiver options)
+* LineReceiverPort - port on which line receiver is listening (mutually
+  exclusive with PickleReceiver options)
+* PickleReceiverHost - hostname or IP address where a Carbon pickle receiver
+  is listening (mutually exclusive with LineReceiver options)
+* PickleReceiverPort - port on which pickle receiver is listening (mutually
+  exclusive with LineReceiver options)
 * TypesDB - file(s) defining your Collectd types. This should be the
   sames as your TypesDB global config parameters. If not specified, the
   plugin will not work.
@@ -53,6 +58,11 @@ following parameters are recognized:
   below.
 * LowercaseMetricNames - If present, all metric names will be converted
   to lower-case.
+* ManglePlugin - If present, the passed string will be imported and will call
+  the mangle_path function with the following parameters (prefix, postfix, values).
+  The result if not None will be the full path of the datapoint for graphite minus
+  the last ds_name that will hold the actual value. If the function returns None,
+  the entire datapoint and all its values will be ignored.
 * MetricPrefix - If present, all metric names will contain this string
   prefix. Do not include a trailing period.
 * HostPostfix - If present, all hostnames will contain this string
@@ -134,6 +144,10 @@ The *data_source* values for this type would be *used* and *free*
 yielding the metrics (along the lines of)
 *hostname_domain.plugin.df.used* and *hostname_domain.plugin.df.free*.
 
+Instead, if you configure carbon_writer to have a ManglePlugin, this
+class will have full control over how the path will be made. No
+additional processing will done to the path except for DifferentiateCounters.
+
 ## COUNTER and DERIVE Types
 
 Collectd data types, like RRDTool, differentiate between ABSOLUTE,
@@ -172,7 +186,7 @@ results that are normalized to around 100 (like RRD).
 
 # Troubleshooting
 
-You can see the raw values dispatched to carbon by packet sniffing:
+You can see the raw values dispatched to carbon when using the line receiver by packet sniffing:
 
     $ sudo ngrep -qd any . tcp dst port 2003
 
